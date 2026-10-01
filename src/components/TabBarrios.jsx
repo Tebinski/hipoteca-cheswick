@@ -3,12 +3,15 @@ import {
   ResponsiveContainer, ComposedChart, ScatterChart, Scatter, Bar, Line, Cell, CartesianGrid, XAxis, YAxis,
   Tooltip, Legend, ReferenceLine,
 } from "recharts";
-import { CHESWICK_PROPERTIES, CHESWICK_YEARLY, CHESWICK_SUMMARY } from "../cheswick_data";
-import CheswickMap from "./CheswickMap";
+import { AREAS } from "../areas";
+import { yearlyStats, summaryStats } from "../areas/stats";
+import AreasMap from "./AreasMap";
 
 const PRICE_COLOR = "#7ecfe0";
 const YOY_COLOR = "#e88bba";
-const TYPE_COLORS = { detached: "#e88bba", "semi-detached": "#7ecfe0", terraced: "#fbbf24" };
+const TYPE_COLORS = { detached: "#e88bba", "semi-detached": "#7ecfe0", terraced: "#fbbf24", flat: "#a78bfa" };
+const TYPE_LABELS = { detached: "Detached", "semi-detached": "Semi-detached", terraced: "Terraced", flat: "Pisos" };
+const STORAGE_KEY = "barrios.selected";
 const AVG_COLOR = "#34d399";
 const OVERALL_COLOR = "#f87171";
 
@@ -29,19 +32,63 @@ function StatCard({ label, value, sub, color = "#e2e8f0" }) {
   );
 }
 
-export default function TabCheswick() {
+function chipStyle(active, color = "#4a6580") {
+  return {
+    fontSize: 10, padding: "4px 10px", borderRadius: 6, cursor: "pointer", fontFamily: "inherit",
+    background: active ? "#1e2537" : "transparent",
+    border: `1px solid ${active ? color : "#1e2537"}`,
+    color: active ? "#e2e8f0" : "#4a6580",
+  };
+}
+
+function readStoredArea() {
+  try {
+    return localStorage.getItem(STORAGE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+export default function TabBarrios() {
+  const [selectedId, setSelectedId] = useState(() => {
+    const stored = readStoredArea();
+    return AREAS.some((a) => a.id === stored) ? stored : AREAS[0]?.id;
+  });
+  const area = AREAS.find((a) => a.id === selectedId) ?? AREAS[0];
+  const [hiddenTypes, setHiddenTypes] = useState([]);
   const [sortBy, setSortBy] = useState("cagr");
-  const [onlyUngeocoded, setOnlyUngeocoded] = useState(false);
+  const [onlyApprox, setOnlyApprox] = useState(false);
   const [search, setSearch] = useState("");
 
-  const ungeocodedCount = useMemo(() => CHESWICK_PROPERTIES.filter((p) => p.lat == null || p.lon == null).length, []);
+  const selectArea = (id) => {
+    setSelectedId(id);
+    setHiddenTypes([]);
+    setOnlyApprox(false);
+    setSearch("");
+    try {
+      localStorage.setItem(STORAGE_KEY, id);
+    } catch {
+      // sin almacenamiento local: la selección simplemente no se recuerda
+    }
+  };
+  const toggleType = (t) => setHiddenTypes((h) => (h.includes(t) ? h.filter((x) => x !== t) : [...h, t]));
+
+  // Viviendas del barrio seleccionado, filtradas por tipo: alimentan el mapa, los gráficos y la tabla.
+  const properties = useMemo(
+    () => (area ? area.properties.filter((p) => !hiddenTypes.includes(p.type)) : []),
+    [area, hiddenTypes]
+  );
+  const yearly = useMemo(() => yearlyStats(properties), [properties]);
+  const s = useMemo(() => summaryStats(properties), [properties]);
+
+  const approxCount = useMemo(() => properties.filter((p) => p.approxLocation || p.lat == null).length, [properties]);
 
   const cagrRanked = useMemo(() => {
-    return CHESWICK_PROPERTIES
+    return properties
       .filter((p) => p.cagr != null)
       .sort((a, b) => b.cagr - a.cagr)
       .map((p, i) => ({ ...p, rank: i + 1, saleYear: new Date(p.sales[p.sales.length - 1].date).getFullYear() }));
-  }, []);
+  }, [properties]);
 
   // Correlación (Pearson) entre el año de la última venta y el CAGR conseguido:
   // ¿las revalorizaciones más altas se concentran en ventas más recientes o más antiguas?
@@ -61,11 +108,12 @@ export default function TabCheswick() {
     return denom > 0 ? num / denom : null;
   }, [cagrRanked]);
 
+  // Recuento por tipo sobre el barrio completo (sin filtrar), para los botones de filtro.
   const typeCounts = useMemo(() => {
-    const out = { detached: 0, "semi-detached": 0, terraced: 0 };
-    CHESWICK_PROPERTIES.forEach((p) => { out[p.type] = (out[p.type] ?? 0) + 1; });
+    const out = {};
+    (area?.properties ?? []).forEach((p) => { out[p.type] = (out[p.type] ?? 0) + 1; });
     return out;
-  }, []);
+  }, [area]);
 
   const avgCagrByType = useMemo(() => {
     const sums = {};
@@ -80,7 +128,7 @@ export default function TabCheswick() {
   }, [cagrRanked]);
 
   const tableRows = useMemo(() => {
-    let rows = onlyUngeocoded ? CHESWICK_PROPERTIES.filter((p) => p.lat == null || p.lon == null) : [...CHESWICK_PROPERTIES];
+    let rows = onlyApprox ? properties.filter((p) => p.approxLocation || p.lat == null) : [...properties];
     const q = search.trim().toLowerCase();
     if (q) {
       rows = rows.filter((p) => p.label.toLowerCase().includes(q) || p.postcode.toLowerCase().includes(q));
@@ -93,27 +141,70 @@ export default function TabCheswick() {
       rows.sort((a, b) => b.sales[b.sales.length - 1].price - a.sales[a.sales.length - 1].price);
     }
     return rows;
-  }, [sortBy, onlyUngeocoded, search]);
+  }, [properties, sortBy, onlyApprox, search]);
 
-  const knownStreets = useMemo(() => [...new Set(CHESWICK_PROPERTIES.map((p) => p.label.replace(/^\S+\s/, "")))].sort(), []);
+  const knownStreets = useMemo(() => [...new Set((area?.properties ?? []).map((p) => p.street))].sort(), [area]);
 
-  const s = CHESWICK_SUMMARY;
+  if (!area) {
+    return (
+      <div style={{ fontSize: 12, color: "#4a6580" }}>
+        No hay barrios todavía. Añade uno en scripts/areas_config.py y ejecuta{" "}
+        <code>uv run --no-project python scripts/fetch_area.py</code>.
+      </div>
+    );
+  }
+
   const resoldPct = s.totalProperties > 0 ? (s.resoldCount / s.totalProperties) * 100 : 0;
+  const shownTypes = area.types.filter((t) => typeCounts[t]);
 
   return (
     <div>
-      <div style={{ marginBottom: 20 }}>
-        <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 6 }}>
-          Cheswick Village, Bristol (BS16) — solo casas (detached / semi-detached / terraced)
+      <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "16px 16px 12px", marginBottom: 20 }}>
+        <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 10 }}>
+          Barrio — elige aquí o clica su círculo en el mapa
         </div>
-        <div style={{ fontSize: 11, color: "#334155" }}>
-          Datos públicos de HM Land Registry Price Paid Data ({s.firstSaleDate} → {s.lastSaleDate}), sin nombres de
-          comprador/vendedor. Cobertura: 17 calles de la urbanización. No incluye pisos/apartamentos.
+        <div style={{ display: "grid", gridTemplateColumns: `repeat(${Math.min(AREAS.length, 4)}, 1fr)`, gap: 8, marginBottom: 12 }}>
+          {AREAS.map((a) => {
+            const active = a.id === area.id;
+            return (
+              <button
+                key={a.id}
+                onClick={() => selectArea(a.id)}
+                style={{
+                  textAlign: "left", cursor: "pointer", fontFamily: "inherit", borderRadius: 10, padding: "10px 12px",
+                  background: active ? `${PRICE_COLOR}14` : "#0d1117", border: `1px solid ${active ? PRICE_COLOR : "#1e2537"}`,
+                }}
+              >
+                <div style={{ fontSize: 12, fontWeight: 700, color: active ? PRICE_COLOR : "#e2e8f0" }}>{a.name}</div>
+                <div style={{ fontSize: 10, color: "#4a6580", marginTop: 2 }}>
+                  {a.place} · {a.properties.length} viviendas
+                </div>
+              </button>
+            );
+          })}
         </div>
+        <div style={{ fontSize: 11, color: "#334155", marginBottom: 10 }}>
+          {area.description} Datos públicos de HM Land Registry Price Paid Data ({s.firstSaleDate ?? "—"} → {s.lastSaleDate ?? "—"}),
+          sin nombres de comprador/vendedor. Actualizado {area.generatedAt}.
+        </div>
+        {shownTypes.length > 1 && (
+          <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
+            <span style={{ fontSize: 10, color: "#4a6580", marginRight: 4 }}>Tipo de vivienda:</span>
+            {shownTypes.map((t) => (
+              <button key={t} onClick={() => toggleType(t)} style={chipStyle(!hiddenTypes.includes(t), TYPE_COLORS[t])}>
+                <span style={{ color: TYPE_COLORS[t] }}>■</span> {TYPE_LABELS[t]} ({typeCounts[t]})
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 12 }}>
-        <StatCard label="Casas con registro de compraventa" value={s.totalProperties} sub={`${typeCounts.detached} detached · ${typeCounts["semi-detached"]} semi · ${typeCounts.terraced} terraced`} />
+        <StatCard
+          label="Viviendas con registro de compraventa"
+          value={s.totalProperties}
+          sub={shownTypes.filter((t) => !hiddenTypes.includes(t)).map((t) => `${typeCounts[t]} ${TYPE_LABELS[t].toLowerCase()}`).join(" · ")}
+        />
         <StatCard label="Transacciones totales" value={s.totalTransactions} sub={`${s.newBuildCount} primera venta (constructor)`} />
         <StatCard label="Revendidas al menos una vez" value={s.resoldCount} sub={`${resoldPct.toFixed(0)}% del total`} color={AVG_COLOR} />
       </div>
@@ -122,7 +213,7 @@ export default function TabCheswick() {
         <StatCard
           label="CAGR medio por propiedad (revendidas)"
           value={s.avgCagr != null ? pct(s.avgCagr) : "—"}
-          sub="Media de la apreciación anualizada individual de cada casa revendida"
+          sub="Media de la apreciación anualizada individual de cada vivienda revendida"
           color={AVG_COLOR}
         />
         <StatCard
@@ -135,13 +226,13 @@ export default function TabCheswick() {
 
       <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "16px 16px 8px", marginBottom: 20 }}>
         <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
-          Plano — cada punto es una casa
+          Mapa — cada punto es una vivienda
         </div>
         <div style={{ fontSize: 10, color: "#334155", marginBottom: 10 }}>
-          Haz zoom y clica en una casa para ver su historial de compraventa. Color = CAGR (rojo bajo, verde alto);
+          Haz zoom y clica en una vivienda para ver su historial de compraventa; clica otro círculo para cambiar de barrio. Color = CAGR (rojo bajo, verde alto);
           gris = sin reventa registrada (solo primera venta). Coordenadas de OpenStreetMap.
         </div>
-        <CheswickMap properties={CHESWICK_PROPERTIES} />
+        <AreasMap areas={AREAS} selectedId={area.id} onSelect={selectArea} properties={properties} />
       </div>
 
       <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "16px 16px 8px", marginBottom: 20 }}>
@@ -153,7 +244,7 @@ export default function TabCheswick() {
           Muestra pequeña en algunos años (ver nº de ventas en el tooltip) — lecturas ruidosas, no es un índice de precios homogéneo.
         </div>
         <ResponsiveContainer width="100%" height={260}>
-          <ComposedChart data={CHESWICK_YEARLY} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
+          <ComposedChart data={yearly} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1e2537" vertical={false} />
             <XAxis dataKey="year" tick={{ fill: "#4a6580", fontSize: 9 }} tickLine={false} axisLine={false} />
             <YAxis yAxisId="left" tickFormatter={(v) => `£${(v / 1000).toFixed(0)}k`} tick={{ fill: "#4a6580", fontSize: 9 }} tickLine={false} axisLine={false} />
@@ -181,19 +272,21 @@ export default function TabCheswick() {
 
       <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "16px 16px 8px", marginBottom: 20 }}>
         <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
-          CAGR por propiedad — solo casas revendidas al menos una vez ({cagrRanked.length})
+          CAGR por propiedad — solo viviendas revendidas al menos una vez ({cagrRanked.length})
         </div>
         <div style={{ fontSize: 10, color: "#334155", marginBottom: 10 }}>
-          Cada barra es una casa, ordenada de mayor a menor apreciación anualizada entre su primera y su última venta
-          registrada. <span style={{ color: TYPE_COLORS.detached }}>■ Detached</span> ·{" "}
-          <span style={{ color: TYPE_COLORS["semi-detached"] }}>■ Semi-detached</span> ·{" "}
-          <span style={{ color: TYPE_COLORS.terraced }}>■ Terraced</span>. Líneas: <span style={{ color: AVG_COLOR }}>media</span> y{" "}
+          Cada barra es una vivienda, ordenada de mayor a menor apreciación anualizada entre su primera y su última venta
+          registrada.{" "}
+          {shownTypes.filter((t) => !hiddenTypes.includes(t)).map((t, i) => (
+            <span key={t} style={{ color: TYPE_COLORS[t] }}>{i > 0 ? " · " : ""}■ {TYPE_LABELS[t]}</span>
+          ))}
+          . Líneas: <span style={{ color: AVG_COLOR }}>media</span> y{" "}
           <span style={{ color: OVERALL_COLOR }}>CAGR global</span>.
         </div>
         <ResponsiveContainer width="100%" height={280}>
           <ComposedChart data={cagrRanked} margin={{ top: 4, right: 8, left: 0, bottom: 0 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="#1e2537" vertical={false} />
-            <XAxis dataKey="rank" tick={false} axisLine={false} tickLine={false} label={{ value: "Casas revendidas, ordenadas por CAGR", position: "insideBottom", offset: -2, fill: "#4a6580", fontSize: 9 }} />
+            <XAxis dataKey="rank" tick={false} axisLine={false} tickLine={false} label={{ value: "Viviendas revendidas, ordenadas por CAGR", position: "insideBottom", offset: -2, fill: "#4a6580", fontSize: 9 }} />
             <YAxis tickFormatter={(v) => `${(v * 100).toFixed(0)}%`} tick={{ fill: "#4a6580", fontSize: 9 }} tickLine={false} axisLine={false} />
             <Tooltip
               content={({ active, payload }) => {
@@ -211,8 +304,8 @@ export default function TabCheswick() {
                 );
               }}
             />
-            <ReferenceLine y={s.avgCagr} stroke={AVG_COLOR} strokeDasharray="4 4" label={{ value: `Media ${pct(s.avgCagr)}`, position: "right", fill: AVG_COLOR, fontSize: 10 }} />
-            <ReferenceLine y={s.overallCagr} stroke={OVERALL_COLOR} strokeDasharray="2 3" label={{ value: `Global ${pct(s.overallCagr)}`, position: "right", fill: OVERALL_COLOR, fontSize: 10 }} />
+            {s.avgCagr != null && <ReferenceLine y={s.avgCagr} stroke={AVG_COLOR} strokeDasharray="4 4" label={{ value: `Media ${pct(s.avgCagr)}`, position: "right", fill: AVG_COLOR, fontSize: 10 }} />}
+            {s.overallCagr != null && <ReferenceLine y={s.overallCagr} stroke={OVERALL_COLOR} strokeDasharray="2 3" label={{ value: `Global ${pct(s.overallCagr)}`, position: "right", fill: OVERALL_COLOR, fontSize: 10 }} />}
             <ReferenceLine y={0} stroke="#334155" />
             <Bar dataKey="cagr" name="CAGR">
               {cagrRanked.map((d) => (
@@ -228,11 +321,14 @@ export default function TabCheswick() {
           CAGR vs. años que se mantuvo la propiedad
         </div>
         <div style={{ fontSize: 10, color: "#334155", marginBottom: 10 }}>
-          Cada punto es una casa revendida: cuánto tiempo pasó entre su primera y su última venta (eje X) frente a la
+          Cada punto es una vivienda revendida: cuánto tiempo pasó entre su primera y su última venta (eje X) frente a la
           apreciación anualizada conseguida (eje Y).{" "}
-          <span style={{ color: TYPE_COLORS.detached }}>■ Detached{avgCagrByType.detached != null ? ` (media ${pct(avgCagrByType.detached)})` : ""}</span> ·{" "}
-          <span style={{ color: TYPE_COLORS["semi-detached"] }}>■ Semi-detached{avgCagrByType["semi-detached"] != null ? ` (media ${pct(avgCagrByType["semi-detached"])})` : ""}</span> ·{" "}
-          <span style={{ color: TYPE_COLORS.terraced }}>■ Terraced{avgCagrByType.terraced != null ? ` (media ${pct(avgCagrByType.terraced)})` : ""}</span>.
+          {shownTypes.filter((t) => !hiddenTypes.includes(t)).map((t, i) => (
+            <span key={t} style={{ color: TYPE_COLORS[t] }}>
+              {i > 0 ? " · " : ""}■ {TYPE_LABELS[t]}{avgCagrByType[t] != null ? ` (media ${pct(avgCagrByType[t])})` : ""}
+            </span>
+          ))}
+          .
         </div>
         <ResponsiveContainer width="100%" height={280}>
           <ScatterChart margin={{ top: 4, right: 16, left: 0, bottom: 4 }}>
@@ -257,7 +353,7 @@ export default function TabCheswick() {
               axisLine={false}
             />
             <ReferenceLine y={0} stroke="#334155" />
-            <ReferenceLine y={s.avgCagr} stroke={AVG_COLOR} strokeDasharray="4 4" label={{ value: `Media ${pct(s.avgCagr)}`, position: "right", fill: AVG_COLOR, fontSize: 10 }} />
+            {s.avgCagr != null && <ReferenceLine y={s.avgCagr} stroke={AVG_COLOR} strokeDasharray="4 4" label={{ value: `Media ${pct(s.avgCagr)}`, position: "right", fill: AVG_COLOR, fontSize: 10 }} />}
             {Object.entries(avgCagrByType).map(([type, avg]) => (
               <ReferenceLine
                 key={type}
@@ -296,7 +392,7 @@ export default function TabCheswick() {
           CAGR vs. año de venta
         </div>
         <div style={{ fontSize: 10, color: "#334155", marginBottom: 10 }}>
-          Cada punto es una casa revendida: en qué año se realizó su última venta (eje X) frente al CAGR conseguido
+          Cada punto es una vivienda revendida: en qué año se realizó su última venta (eje X) frente al CAGR conseguido
           (eje Y) — para ver si las revalorizaciones altas se concentran en algún periodo concreto.{" "}
           {saleYearCorrelation != null && (
             <span style={{ color: Math.abs(saleYearCorrelation) > 0.3 ? OVERALL_COLOR : "#4a6580", fontWeight: 700 }}>
@@ -329,7 +425,7 @@ export default function TabCheswick() {
               axisLine={false}
             />
             <ReferenceLine y={0} stroke="#334155" />
-            <ReferenceLine y={s.avgCagr} stroke={AVG_COLOR} strokeDasharray="4 4" label={{ value: `Media ${pct(s.avgCagr)}`, position: "right", fill: AVG_COLOR, fontSize: 10 }} />
+            {s.avgCagr != null && <ReferenceLine y={s.avgCagr} stroke={AVG_COLOR} strokeDasharray="4 4" label={{ value: `Media ${pct(s.avgCagr)}`, position: "right", fill: AVG_COLOR, fontSize: 10 }} />}
             <Tooltip
               cursor={{ strokeDasharray: "3 3" }}
               content={({ active, payload }) => {
@@ -356,7 +452,7 @@ export default function TabCheswick() {
       <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, overflow: "hidden", marginBottom: 20 }}>
         <div style={{ padding: "12px 18px", borderBottom: "1px solid #1e2537", display: "flex", justifyContent: "space-between", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
           <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.1em", textTransform: "uppercase" }}>
-            Detalle por propiedad ({tableRows.length}{(onlyUngeocoded || search.trim()) ? ` de ${CHESWICK_PROPERTIES.length}` : ""})
+            Detalle por propiedad ({tableRows.length}{(onlyApprox || search.trim()) ? ` de ${properties.length}` : ""})
           </div>
           <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
             <input
@@ -392,17 +488,17 @@ export default function TabCheswick() {
                 {o.label}
               </button>
             ))}
-            {ungeocodedCount > 0 && (
+            {approxCount > 0 && (
               <button
-                onClick={() => setOnlyUngeocoded((v) => !v)}
+                onClick={() => setOnlyApprox((v) => !v)}
                 style={{
                   fontSize: 10, padding: "4px 10px", borderRadius: 6, cursor: "pointer",
-                  background: onlyUngeocoded ? "#1e2537" : "transparent",
-                  border: `1px solid ${onlyUngeocoded ? OVERALL_COLOR : "#1e2537"}`,
-                  color: onlyUngeocoded ? OVERALL_COLOR : "#4a6580",
+                  background: onlyApprox ? "#1e2537" : "transparent",
+                  border: `1px solid ${onlyApprox ? OVERALL_COLOR : "#1e2537"}`,
+                  color: onlyApprox ? OVERALL_COLOR : "#4a6580",
                 }}
               >
-                ⚠ Solo sin coordenadas ({ungeocodedCount})
+                ⚠ Solo ubicación aproximada ({approxCount})
               </button>
             )}
           </div>
@@ -427,8 +523,8 @@ export default function TabCheswick() {
                   <tr key={`${p.postcode}-${p.paon}-${p.saon}`} style={{ borderTop: "1px solid #1e253766", background: i % 2 === 0 ? "transparent" : "#0d111766" }}>
                     <td style={{ padding: "7px 16px", color: "#e2e8f0" }}>
                       {p.label}
-                      {(p.lat == null || p.lon == null) && (
-                        <span title="Sin coordenadas en OpenStreetMap" style={{ color: OVERALL_COLOR, marginLeft: 6 }}>⚠</span>
+                      {(p.approxLocation || p.lat == null) && (
+                        <span title={p.lat == null ? "Sin coordenadas" : "Ubicación aproximada (centro del código postal)"} style={{ color: OVERALL_COLOR, marginLeft: 6 }}>⚠</span>
                       )}
                     </td>
                     <td style={{ padding: "7px 12px", color: TYPE_COLORS[p.type] }}>{p.type}</td>
@@ -449,12 +545,12 @@ export default function TabCheswick() {
           </table>
           {tableRows.length === 0 && (
             <div style={{ padding: "24px 18px", fontSize: 12, color: "#4a6580", textAlign: "center" }}>
-              Sin resultados para "{search}". Solo hay datos de estas calles de Cheswick Village: {knownStreets.join(", ")}.
+              Sin resultados para "{search}". Calles con datos en {area.name}: {knownStreets.join(", ")}.
             </div>
           )}
         </div>
         <div style={{ padding: "8px 18px", fontSize: 10, color: "#334155", borderTop: "1px solid #1e2537" }}>
-          ✳ = primera venta como obra nueva (Redrow). Fuente: HM Land Registry Price Paid Data (Open Government Licence).
+          ✳ = primera venta como obra nueva. Fuente: {area.source}.
         </div>
       </div>
     </div>

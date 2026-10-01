@@ -1,11 +1,11 @@
-# Hipoteca & Cheswick Village
+# Hipoteca & Barrios
 
 Dashboard offline (Vite + React + recharts) con dos calculadoras/vistas:
 
 - **Hipoteca** — simulador de cuota, amortización anticipada e interés vs. capital.
-- **Cheswick Village** — evolución de precios de la urbanización (Bristol BS16) a partir de datos públicos de HM Land Registry, con mapa (react-leaflet).
+- **Barrios** — evolución de precios y CAGR por vivienda de varios barrios (Cheswick Village, St Pauls…) a partir de datos públicos de HM Land Registry, con mapa (react-leaflet) para elegir el barrio.
 
-Sin backend: todo se calcula en el cliente. `src/cheswick_data.js` son datos públicos de compraventas (no hay datos personales/bancarios en este repo).
+Sin backend: todo se calcula en el cliente. `src/areas/data/*.json` son datos públicos de compraventas (no hay datos personales/bancarios en este repo).
 
 ## Desarrollo local
 
@@ -32,8 +32,12 @@ No hace falta configuración especial: es un build estático de Vite.
    - **Cloudflare Pages** ([pages.cloudflare.com](https://pages.cloudflare.com)): "Create a project" → conecta el repo. Framework preset: `Vite`. Build command: `npm run build`, Build output directory: `dist`.
 3. Cada `git push` a `master` vuelve a desplegar automáticamente. Comparte la URL que te den (tipo `*.vercel.app` o `*.pages.dev`) con quien quieras.
 
-## Regenerar datos de Cheswick
+## Añadir o actualizar barrios
 
-```bash
-python src/process_cheswick.py
-```
+1. Añade una entrada en `scripts/areas_config.py`: por lista de calles (`mode: "streets"`) o por código postal + radio (`mode: "radius"`), y los tipos de vivienda a incluir.
+2. Descarga los datos (solo librería estándar de Python):
+   ```bash
+   uv run --no-project python scripts/fetch_area.py            # todos los barrios
+   uv run --no-project python scripts/fetch_area.py <id>       # uno concreto
+   ```
+3. Se escribe `src/areas/data/<id>.json` y la pestaña **Barrios** lo muestra automáticamente — no hay que tocar la interfaz.

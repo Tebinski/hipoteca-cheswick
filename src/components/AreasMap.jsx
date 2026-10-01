@@ -1,6 +1,36 @@
-import React, { useMemo, useState } from "react";
-import { MapContainer, TileLayer, CircleMarker, Popup, Tooltip } from "react-leaflet";
+import React, { useEffect, useMemo, useState } from "react";
+import { MapContainer, TileLayer, CircleMarker, Circle, Popup, Tooltip, useMap } from "react-leaflet";
 import "leaflet/dist/leaflet.css";
+
+const AREA_COLOR = "#7ecfe0";
+
+// Distancia aproximada en metros entre dos puntos (suficiente a escala de barrio).
+function metersBetween([lat1, lon1], [lat2, lon2]) {
+  const dy = (lat2 - lat1) * 111320;
+  const dx = (lon2 - lon1) * 111320 * Math.cos((lat1 * Math.PI) / 180);
+  return Math.hypot(dx, dy);
+}
+
+// Círculo que representa cada barrio en el mapa: el radio configurado, o el que envuelve sus viviendas.
+function areaOutline(area) {
+  const pts = area.properties.filter((p) => p.lat != null).map((p) => [p.lat, p.lon]);
+  if (area.radiusM) return { center: area.center, radius: area.radiusM };
+  if (!pts.length) return { center: area.center, radius: 200 };
+  const center = [pts.reduce((s, p) => s + p[0], 0) / pts.length, pts.reduce((s, p) => s + p[1], 0) / pts.length];
+  return { center, radius: Math.max(...pts.map((p) => metersBetween(center, p))) + 30 };
+}
+
+// Encuadra el mapa en el barrio seleccionado cada vez que cambia.
+function FitToArea({ outline }) {
+  const map = useMap();
+  useEffect(() => {
+    const { center, radius } = outline;
+    const dLat = radius / 111320;
+    const dLon = dLat / Math.cos((center[0] * Math.PI) / 180);
+    map.flyToBounds([[center[0] - dLat, center[1] - dLon], [center[0] + dLat, center[1] + dLon]], { duration: 0.8, padding: [20, 20] });
+  }, [map, outline]);
+  return null;
+}
 
 const NEVER_RESOLD_COLOR = "#4a6580";
 
@@ -55,17 +85,16 @@ const MODES = [
   { id: "recency", label: "Color: última venta" },
 ];
 
-export default function CheswickMap({ properties }) {
+// areas: todos los barrios (círculos clicables) · selectedId/onSelect: barrio activo ·
+// properties: viviendas del barrio activo ya filtradas (las que se pintan como puntos).
+export default function AreasMap({ areas, selectedId, onSelect, properties }) {
   const [mode, setMode] = useState("cagr");
   const [showLabels, setShowLabels] = useState(true);
 
+  const outlines = useMemo(() => Object.fromEntries(areas.map((a) => [a.id, areaOutline(a)])), [areas]);
   const geocoded = useMemo(() => properties.filter((p) => p.lat != null && p.lon != null), [properties]);
-  const center = useMemo(() => {
-    if (!geocoded.length) return [51.497, -2.557];
-    const lat = geocoded.reduce((s, p) => s + p.lat, 0) / geocoded.length;
-    const lon = geocoded.reduce((s, p) => s + p.lon, 0) / geocoded.length;
-    return [lat, lon];
-  }, [geocoded]);
+  const approxCount = useMemo(() => geocoded.filter((p) => p.approxLocation).length, [geocoded]);
+  const initialCenter = outlines[selectedId]?.center ?? [51.4545, -2.5879];
 
   const recencyRange = useMemo(() => {
     const timestamps = geocoded.map((p) => new Date(p.sales[p.sales.length - 1].date).getTime());
@@ -128,7 +157,7 @@ export default function CheswickMap({ properties }) {
 
       <div style={{ position: "relative" }}>
       <MapContainer
-        center={center}
+        center={initialCenter}
         zoom={16}
         scrollWheelZoom={true}
         style={{ height: 560, width: "100%", borderRadius: 10, background: "#0d1117" }}
@@ -138,19 +167,45 @@ export default function CheswickMap({ properties }) {
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
           className="cheswick-dark-tiles"
         />
+        {outlines[selectedId] && <FitToArea outline={outlines[selectedId]} />}
+        {areas.map((a) => {
+          const active = a.id === selectedId;
+          return (
+            <Circle
+              key={a.id}
+              center={outlines[a.id].center}
+              radius={outlines[a.id].radius}
+              pathOptions={{
+                color: AREA_COLOR,
+                weight: active ? 1.5 : 2,
+                dashArray: active ? "4 6" : undefined,
+                fillColor: AREA_COLOR,
+                fillOpacity: active ? 0.03 : 0.15,
+              }}
+              eventHandlers={{ click: () => onSelect(a.id) }}
+            >
+              <Tooltip permanent={!active} direction="top" opacity={1} className="cheswick-marker-label">
+                <span className="cheswick-label-text" style={{ fontSize: 11 }}>
+                  {a.name}{active ? "" : " · clic para ver"}
+                </span>
+              </Tooltip>
+            </Circle>
+          );
+        })}
         {geocoded.map((p) => (
           <CircleMarker
             key={`${p.postcode}-${p.paon}-${p.saon}`}
             center={[p.lat, p.lon]}
             radius={p.numSales > 1 ? 8 : 6}
             pathOptions={{
-              color: "#0d1117",
+              color: p.approxLocation ? "#94a3b8" : "#0d1117",
               weight: 1,
+              dashArray: p.approxLocation ? "2 2" : undefined,
               fillColor: colorFor(p),
-              fillOpacity: 0.9,
+              fillOpacity: p.approxLocation ? 0.6 : 0.9,
             }}
           >
-            {showLabels && (
+            {showLabels && p.paon.length <= 5 && !p.saon && (
               <Tooltip permanent direction="top" offset={[0, -6]} opacity={1} className="cheswick-marker-label">
                 <span className="cheswick-label-text">{p.paon}</span>
               </Tooltip>
@@ -158,7 +213,10 @@ export default function CheswickMap({ properties }) {
             <Popup>
               <div style={{ fontFamily: "'DM Mono','Fira Code','Courier New',monospace", fontSize: 12, minWidth: 200 }}>
                 <div style={{ fontWeight: 700, marginBottom: 4 }}>{p.label}</div>
-                <div style={{ color: "#666", marginBottom: 6 }}>{p.type} · {p.postcode}</div>
+                <div style={{ color: "#666", marginBottom: 6 }}>
+                  {p.type} · {p.postcode}
+                  {p.approxLocation && " · ubicación aproximada (centro del código postal)"}
+                </div>
                 {p.sales.map((s, i) => (
                   <div key={i}>
                     {s.date}: {gbp(s.price)}{s.newBuild ? " (obra nueva)" : ""}
@@ -206,11 +264,12 @@ export default function CheswickMap({ properties }) {
           </>
         )}
         <div style={{ marginTop: 2 }}>● grande = revendida · ● pequeño = nunca revendida</div>
+        {approxCount > 0 && <div>◌ borde discontinuo = ubicación aproximada ({approxCount})</div>}
       </div>
 
       {properties.length - geocoded.length > 0 && (
         <div style={{ position: "absolute", top: 10, right: 10, zIndex: 1000, background: "#161b27ee", border: "1px solid #2a3045", borderRadius: 8, padding: "6px 10px", fontSize: 10, color: "#4a6580", maxWidth: 200 }}>
-          {properties.length - geocoded.length} casas sin coordenadas en OpenStreetMap (no aparecen en el mapa, pero sí en la tabla de abajo).
+          {properties.length - geocoded.length} viviendas sin coordenadas (no aparecen en el mapa, pero sí en la tabla de abajo).
         </div>
       )}
       </div>
