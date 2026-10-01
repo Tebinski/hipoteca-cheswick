@@ -8,6 +8,7 @@ const MILESTONE_STEP = 5; // %
 const OPT_COLOR = "#34d399";
 const PES_COLOR = "#f87171";
 const BREAKEVEN_COLOR = "#fbbf24";
+const SP_COLOR = "#a78bfa";
 
 function gbp(n) {
   return `£${Math.round(n).toLocaleString("en-GB")}`;
@@ -47,7 +48,14 @@ function SliderNumber({ label, value, min, max, step, unit, onChange, color = AC
   );
 }
 
-function amortize(principal, annualRatePct, years, monthlyExtra = 0, extraStartMonth = 1) {
+// Penalización por amortización anticipada (ERC): % sobre lo amortizado de más según el año de la hipoteca.
+function penaltyPctAt(month, penalties) {
+  return penalties[Math.floor((month - 1) / 12)] ?? 0;
+}
+
+// lumps: { mes: importe } pagos extra puntuales. penalties: [% año 1, % año 2, ...] — la penalización se paga
+// aparte (no reduce el capital) y se acumula en totalPenalty.
+function amortize(principal, annualRatePct, years, monthlyExtra = 0, extraStartMonth = 1, { lumps = {}, penalties = [] } = {}) {
   const r = annualRatePct / 100 / 12;
   const n = Math.round(years * 12);
   if (n <= 0 || principal <= 0) return { payment: 0, totalInterest: 0, months: 0, schedule: [] };
@@ -56,20 +64,44 @@ function amortize(principal, annualRatePct, years, monthlyExtra = 0, extraStartM
 
   let balance = principal;
   let totalInterest = 0;
+  let totalPenalty = 0;
   const schedule = [];
   let month = 0;
   const cap = n + 12; // safety margin in case of rounding
   while (balance > 0.5 && month < cap) {
     month++;
     const interest = balance * r;
-    const extraNow = month >= extraStartMonth ? monthlyExtra : 0;
+    const extraNow = (month >= extraStartMonth ? monthlyExtra : 0) + (lumps[month] ?? 0);
     let principalPaid = payment - interest + extraNow;
     if (principalPaid > balance) principalPaid = balance;
+    const extraApplied = Math.max(0, principalPaid - (payment - interest));
+    const penalty = (extraApplied * penaltyPctAt(month, penalties)) / 100;
     balance -= principalPaid;
     totalInterest += interest;
-    schedule.push({ month, balance: Math.max(balance, 0), interest, principalPaid });
+    totalPenalty += penalty;
+    schedule.push({ month, balance: Math.max(balance, 0), interest, principalPaid, penalty });
   }
-  return { payment, totalInterest, months: month, schedule };
+  return { payment, totalInterest, totalPenalty, months: month, schedule };
+}
+
+// Reducción de deuda en el mes `horizon` al pagar `amount` de golpe en el mes `month`:
+// saldo sin pago extra − (saldo con el pago + penalizaciones pagadas). Mayor es mejor.
+function lumpReduction(principal, rate, years, amount, month, horizon, penalties, baseBalanceAtH) {
+  const res = amortize(principal, rate, years, 0, 1, { lumps: { [month]: amount }, penalties });
+  const balance = res.schedule[horizon - 1]?.balance ?? 0;
+  const penalty = res.schedule.slice(0, horizon).reduce((s, x) => s + x.penalty, 0);
+  return { reduction: baseBalanceAtH - balance - penalty, balance, penalty };
+}
+
+// Cartera con `initial` aportado en el mes 1 y `monthly` cada mes (1..month), vendida en el mes `month`.
+// Devuelve el valor neto tras impuestos (solo sobre la ganancia) y lo aportado.
+function portfolioValue(initial, monthly, annualReturnPct, month, taxPct) {
+  const g = Math.pow(1 + annualReturnPct / 100, 1 / 12) - 1;
+  let value = 0;
+  for (let k = 1; k <= month; k++) value = value * (k > 1 ? 1 + g : 1) + (k === 1 ? initial : 0) + monthly;
+  const contributed = initial + monthly * month;
+  const gain = value - contributed;
+  return { value: contributed + (gain > 0 ? gain * (1 - taxPct / 100) : gain), contributed };
 }
 
 function StatCard({ label, value, sub, color = "#e2e8f0" }) {
@@ -90,6 +122,15 @@ export default function TabHipoteca() {
   const [extra, setExtra] = useState(0);
   const [extraStartMonth, setExtraStartMonth] = useState(1);
   const [appreciation, setAppreciation] = useState(3);
+  const [penalties, setPenalties] = useState([3, 2, 1]); // % ERC años 1, 2, 3
+  const setPenaltyAt = (i) => (v) => setPenalties((p) => p.map((x, j) => (j === i ? v : x)));
+
+  // Pagos extra a la hipoteca vs aportaciones al S&P 500 y amortizar al final del horizonte.
+  const [lumpAmount, setLumpAmount] = useState(6000); // capital inicial
+  const [lumpMonthly, setLumpMonthly] = useState(0); // aportación recurrente mensual
+  const [lumpHorizonYears, setLumpHorizonYears] = useState(5);
+  const [spReturn, setSpReturn] = useState(10);
+  const [spTax, setSpTax] = useState(0);
 
   // Renovación de hipoteca: escenarios a 5 años tras el año de renovación.
   const [renewalYear, setRenewalYear] = useState(5);
@@ -116,8 +157,8 @@ export default function TabHipoteca() {
 
   const base = useMemo(() => amortize(principal, rate, years, 0), [principal, rate, years]);
   const withExtra = useMemo(
-    () => amortize(principal, rate, years, extra, effectiveStart),
-    [principal, rate, years, extra, effectiveStart]
+    () => amortize(principal, rate, years, extra, effectiveStart, { penalties }),
+    [principal, rate, years, extra, effectiveStart, penalties]
   );
 
   // Barrido: si el mismo pago extra empezara en cada mes posible en vez de esperar,
@@ -128,15 +169,15 @@ export default function TabHipoteca() {
     const step = totalMonths > 240 ? 12 : totalMonths > 120 ? 6 : 3;
     const points = [];
     for (let s = 1; s <= totalMonths; s += step) {
-      const res = amortize(principal, rate, years, extra, s);
+      const res = amortize(principal, rate, years, extra, s, { penalties });
       points.push({
         startMonth: s,
-        interestSaved: base.totalInterest - res.totalInterest,
+        interestSaved: base.totalInterest - res.totalInterest - res.totalPenalty,
         monthsSaved: base.months - res.months,
       });
     }
     return points;
-  }, [principal, rate, years, extra, base]);
+  }, [principal, rate, years, extra, base, penalties]);
 
   const chartData = useMemo(() => {
     const len = base.schedule.length;
@@ -148,7 +189,9 @@ export default function TabHipoteca() {
   }, [base, withExtra, extra]);
 
   const monthsSaved = extra > 0 ? base.months - withExtra.months : 0;
-  const interestSaved = extra > 0 ? base.totalInterest - withExtra.totalInterest : 0;
+  const grossInterestSaved = extra > 0 ? base.totalInterest - withExtra.totalInterest : 0;
+  const penaltyPaid = extra > 0 ? withExtra.totalPenalty : 0;
+  const interestSaved = grossInterestSaved - penaltyPaid;
 
   // Composición de cada cuota (interés vs amortización de capital) para el plan activo.
   const breakdownData = useMemo(() => {
@@ -182,7 +225,7 @@ export default function TabHipoteca() {
       if (extra > 0) {
         const eItem = withExtra.schedule[i];
         cumExtra += eItem?.interest ?? 0;
-        cumPaidExtra += (eItem?.interest ?? 0) + (eItem?.principalPaid ?? 0);
+        cumPaidExtra += (eItem?.interest ?? 0) + (eItem?.principalPaid ?? 0) + (eItem?.penalty ?? 0);
         minPriceExtra = (eItem?.balance ?? 0) + dep + cumPaidExtra;
       }
       return {
@@ -271,6 +314,53 @@ export default function TabHipoteca() {
   const optInterest5y = windowInterest(optRenewal.schedule);
   const pesInterest5y = windowInterest(pesRenewal.schedule);
 
+  // Mismo dinero (capital inicial + aportación mensual), dos destinos: pagos extra a la hipoteca desde el
+  // mes 1, o aportaciones al S&P 500 que se venden y se amortizan de golpe. Se mide la reducción de deuda
+  // (saldo sin pago extra − saldo con pagos − penalizaciones), partiendo de la cuota estándar.
+  const lumpH = Math.min(Math.round(lumpHorizonYears * 12), base.months);
+  const lumpCompare = useMemo(() => {
+    if ((lumpAmount <= 0 && lumpMonthly <= 0) || lumpH < 1) return null;
+    const lumpAt = (amount, month) =>
+      lumpReduction(principal, rate, years, amount, month, month, penalties, base.schedule[month - 1]?.balance ?? 0);
+
+    // Pagos extra a la hipoteca: inicial en el mes 1 + recurrente cada mes.
+    const overpay = amortize(principal, rate, years, lumpMonthly, 1, { lumps: { 1: lumpAmount }, penalties });
+    let cumPen = 0;
+    const sweep = Array.from({ length: lumpH }, (_, i) => {
+      const k = i + 1;
+      const row = overpay.schedule[i];
+      cumPen += row?.penalty ?? 0;
+      const mortgage = (base.schedule[i]?.balance ?? 0) - (row?.balance ?? 0) - cumPen;
+      const sp = portfolioValue(lumpAmount, lumpMonthly, spReturn, k, spTax);
+      return { k, mortgage, mortgagePenalty: cumPen, sp: lumpAt(sp.value, k).reduction, spVal: sp.value, contributed: sp.contributed };
+    });
+    const atH = sweep[lumpH - 1];
+    const spH = lumpAt(atH.spVal, lumpH);
+    const cashH = lumpAt(atH.contributed, lumpH);
+
+    // Rentabilidad anual del S&P a partir de la cual invertir supera a los pagos extra a la hipoteca.
+    const spReductionFor = (ret) => lumpAt(portfolioValue(lumpAmount, lumpMonthly, ret, lumpH, spTax).value, lumpH).reduction;
+    let breakeven = null;
+    if (spReductionFor(100) >= atH.mortgage) {
+      let lo = -50, hi = 100;
+      for (let it = 0; it < 50; it++) {
+        const mid = (lo + hi) / 2;
+        if (spReductionFor(mid) >= atH.mortgage) hi = mid; else lo = mid;
+      }
+      breakeven = hi;
+    }
+    return { sweep, atH, spH, cashH, breakeven };
+  }, [principal, rate, years, base, lumpAmount, lumpMonthly, lumpH, spReturn, spTax, penalties]);
+
+  const lumpOptions = lumpCompare
+    ? [
+        { key: "mortgage", label: "Pagos extra a la hipoteca", value: lumpCompare.atH.mortgage, color: EXTRA_COLOR },
+        { key: "sp", label: `S&P 500 y amortizar en el mes ${lumpH}`, value: lumpCompare.spH.reduction, color: SP_COLOR },
+        { key: "cash", label: `Guardar en efectivo y amortizar en el mes ${lumpH}`, value: lumpCompare.cashH.reduction, color: ACCENT },
+      ]
+    : [];
+  const lumpBest = lumpOptions.reduce((a, b) => (b.value > (a?.value ?? -Infinity) ? b : a), null);
+
   return (
     <div style={{ display: "flex", gap: 20, alignItems: "flex-start" }}>
       <div style={{ width: 280, flexShrink: 0, position: "sticky", top: 20, background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "18px 20px", maxHeight: "calc(100vh - 40px)", overflowY: "auto" }}>
@@ -293,6 +383,15 @@ export default function TabHipoteca() {
         <SliderNumber label="Pago extra mensual (amortización anticipada)" value={extra} min={0} max={3000} step={25} unit="£/mes" onChange={setExtra} color={EXTRA_COLOR} />
         <SliderNumber label="Mes en que empieza el pago extra" value={effectiveStart} min={1} max={maxStartMonth} step={1} unit="mes" onChange={setExtraStartMonth} color={EXTRA_COLOR} />
         <SliderNumber label="Apreciación anual de la vivienda" value={appreciation} min={-5} max={10} step={0.1} unit="%/año" onChange={setAppreciation} color={EQUITY_COLOR} />
+        <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.12em", textTransform: "uppercase", margin: "6px 0 12px" }}>
+          Penalización por amortizar (ERC)
+        </div>
+        {penalties.map((p, i) => (
+          <SliderNumber key={i} label={`Año ${i + 1}`} value={p} min={0} max={5} step={0.25} unit="%" onChange={setPenaltyAt(i)} color={PES_COLOR} />
+        ))}
+        <div style={{ fontSize: 10, color: "#334155", marginTop: -6 }}>
+          % sobre cada pago extra hecho en ese año; se paga aparte y no reduce el capital. A partir del año {penalties.length + 1}, sin penalización.
+        </div>
       </div>
 
       <div style={{ flex: 1, minWidth: 0 }}>
@@ -312,9 +411,9 @@ export default function TabHipoteca() {
           color={extra > 0 ? EXTRA_COLOR : "#4a6580"}
         />
         <StatCard
-          label="Intereses ahorrados"
+          label="Ahorro neto (intereses − penalización)"
           value={extra > 0 ? gbp(interestSaved) : "—"}
-          sub={extra > 0 ? `de ${gbp(base.totalInterest)} totales` : "Sube el pago extra para ver el impacto"}
+          sub={extra > 0 ? `${gbp(grossInterestSaved)} intereses − ${gbp(penaltyPaid)} penalización` : "Sube el pago extra para ver el impacto"}
           color={extra > 0 ? EXTRA_COLOR : "#4a6580"}
         />
       </div>
@@ -508,7 +607,7 @@ export default function TabHipoteca() {
         </div>
         <div style={{ fontSize: 10, color: "#334155", marginBottom: 10 }}>
           {extra > 0
-            ? `Mismo pago extra de ${gbp(extra)}/mes, pero empezando en distintos momentos: cuanto más tarde empiezas, menos interés ahorras — cada mes de retraso es intereses que ya no se pueden recuperar.`
+            ? `Mismo pago extra de ${gbp(extra)}/mes, pero empezando en distintos momentos: cuanto más tarde empiezas, menos interés ahorras — cada mes de retraso es intereses que ya no se pueden recuperar. Ahorro neto de la penalización por amortizar en los primeros años.`
             : "Sube el pago extra en el panel de la izquierda para ver cómo cambia el ahorro según el mes en que empieces a pagarlo."}
         </div>
         <ResponsiveContainer width="100%" height={240}>
@@ -535,13 +634,13 @@ export default function TabHipoteca() {
                     <div style={{ color: "#94a3b8", marginBottom: 6, fontWeight: 700 }}>
                       Empezando en el mes {label} · año {(label / 12).toFixed(1)}
                     </div>
-                    <div style={{ color: EXTRA_COLOR }}>Interés ahorrado: {gbp(d.interestSaved)}</div>
+                    <div style={{ color: EXTRA_COLOR }}>Ahorro neto: {gbp(d.interestSaved)}</div>
                     <div style={{ color: "#94a3b8" }}>Meses ahorrados: {d.monthsSaved}</div>
                   </div>
                 );
               }}
             />
-            <Area type="monotone" dataKey="interestSaved" name="Interés ahorrado" stroke={EXTRA_COLOR} fill={`${EXTRA_COLOR}22`} strokeWidth={2} dot={false} />
+            <Area type="monotone" dataKey="interestSaved" name="Ahorro neto" stroke={EXTRA_COLOR} fill={`${EXTRA_COLOR}22`} strokeWidth={2} dot={false} />
             {extra > 0 && (
               <ReferenceDot
                 x={effectiveStart}
@@ -555,6 +654,124 @@ export default function TabHipoteca() {
             )}
           </ComposedChart>
         </ResponsiveContainer>
+      </div>
+
+      <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "16px 16px 8px", marginBottom: 20 }}>
+        <div style={{ fontSize: 11, color: "#4a6580", letterSpacing: "0.12em", textTransform: "uppercase", marginBottom: 4 }}>
+          Pagos extra a la hipoteca vs aportaciones al S&amp;P 500
+        </div>
+        <div style={{ fontSize: 10, color: "#334155", marginBottom: 14 }}>
+          Mismo dinero, dos destinos: un capital inicial (mes 1) más una aportación mensual durante {lumpH} meses. O bien se
+          destina a <span style={{ color: EXTRA_COLOR }}>pagos extra a la hipoteca</span> desde el primer mes (con la penalización
+          de cada año), o bien se <span style={{ color: SP_COLOR }}>invierte en el S&amp;P 500</span> y en el mes {lumpH} se vende
+          todo y se amortiza de golpe. Se mide la <b>reducción de deuda en el mes {lumpH}</b>: saldo pendiente sin pagos extra −
+          saldo con ellos − penalizaciones. Parte de la cuota estándar (sin el pago extra mensual del panel).
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", columnGap: 24, marginBottom: 4 }}>
+          <SliderNumber label="Capital inicial (mes 1)" value={lumpAmount} min={0} max={100000} step={500} unit="£" onChange={setLumpAmount} color={EXTRA_COLOR} />
+          <SliderNumber label="Aportación recurrente" value={lumpMonthly} min={0} max={5000} step={25} unit="£/mes" onChange={setLumpMonthly} color={EXTRA_COLOR} />
+          <SliderNumber label="Rentabilidad anualizada S&P 500" value={spReturn} min={-10} max={20} step={0.5} unit="%/año" onChange={setSpReturn} color={SP_COLOR} />
+          <SliderNumber label="Impuesto sobre la ganancia" value={spTax} min={0} max={45} step={1} unit="%" onChange={setSpTax} color={SP_COLOR} />
+          <SliderNumber label="Horizonte (fin del tipo fijo)" value={lumpHorizonYears} min={1} max={10} step={1} unit="años" onChange={setLumpHorizonYears} />
+        </div>
+
+        {lumpCompare ? (
+          <>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 12, marginBottom: 12 }}>
+              <StatCard
+                label="Pagos extra a la hipoteca"
+                value={gbp(lumpCompare.atH.mortgage)}
+                sub={`aportado ${gbp(lumpCompare.atH.contributed)} · penalizaciones ${gbp(lumpCompare.atH.mortgagePenalty)}`}
+                color={EXTRA_COLOR}
+              />
+              <StatCard
+                label={`S&P 500 y amortizar en el mes ${lumpH}`}
+                value={gbp(lumpCompare.spH.reduction)}
+                sub={`la cartera vale ${gbp(lumpCompare.atH.spVal)} · penalización ${gbp(lumpCompare.spH.penalty)}`}
+                color={SP_COLOR}
+              />
+              <StatCard
+                label={`Efectivo y amortizar en el mes ${lumpH}`}
+                value={gbp(lumpCompare.cashH.reduction)}
+                sub="referencia: el dinero guardado sin invertir"
+                color={ACCENT}
+              />
+              <StatCard
+                label="S&P necesario para empatar"
+                value={lumpCompare.breakeven == null ? "—" : `${lumpCompare.breakeven.toFixed(1)}%/año`}
+                sub="rentabilidad mínima para que invertir supere a los pagos extra"
+                color={lumpCompare.breakeven != null && spReturn >= lumpCompare.breakeven ? SP_COLOR : EXTRA_COLOR}
+              />
+            </div>
+
+            <div style={{ fontSize: 12, color: "#94a3b8", marginBottom: 14 }}>
+              Mejor opción con estas hipótesis: <span style={{ color: lumpBest.color, fontWeight: 700 }}>{lumpBest.label}</span>
+              {lumpOptions
+                .filter((o) => o.key !== lumpBest.key)
+                .map((o) => (
+                  <span key={o.key}>
+                    {" "}· {gbp(lumpBest.value - o.value)} mejor que «{o.label.toLowerCase()}»
+                  </span>
+                ))}
+              . Pagar a la hipoteca desde el mes 1 no es lo mismo que pagar lo mismo en el mes {lumpH}: la diferencia de{" "}
+              {gbp(lumpCompare.atH.mortgage - lumpCompare.cashH.reduction)} son los intereses que dejas de pagar en ese tiempo
+              (netos de penalización).
+            </div>
+
+            <div style={{ fontSize: 10, color: "#334155", marginBottom: 10 }}>
+              Eje X: mes en que se cierra la comparación. <span style={{ color: EXTRA_COLOR }}>■</span> deuda reducida con los pagos extra hechos hasta ese mes ·{" "}
+              <span style={{ color: SP_COLOR }}>■</span> si vendieras la cartera ese mes y amortizaras · <span style={{ color: "#64748b" }}>- -</span> total aportado.
+              Las líneas rojas marcan el fin de cada tramo de penalización.
+            </div>
+            <ResponsiveContainer width="100%" height={260}>
+              <ComposedChart data={lumpCompare.sweep} margin={{ top: 12, right: 16, left: 0, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#1e2537" vertical={false} />
+                <XAxis
+                  dataKey="k"
+                  type="number"
+                  domain={[1, lumpH]}
+                  tickFormatter={(m) => `m${m}`}
+                  tick={{ fill: "#4a6580", fontSize: 9 }}
+                  tickLine={false}
+                  axisLine={false}
+                />
+                <YAxis tickFormatter={(v) => `£${(v / 1000).toFixed(1)}k`} tick={{ fill: "#4a6580", fontSize: 9 }} tickLine={false} axisLine={false} domain={["auto", "auto"]} />
+                <Tooltip
+                  content={({ active, payload, label }) => {
+                    if (!active || !payload?.length) return null;
+                    const d = payload[0].payload;
+                    return (
+                      <div style={{ background: "#161b27", border: "1px solid #2a3045", borderRadius: 8, padding: "10px 14px", fontSize: 11 }}>
+                        <div style={{ color: "#94a3b8", marginBottom: 6, fontWeight: 700 }}>
+                          Mes {label} · año {(label / 12).toFixed(1)} · penalización {penaltyPctAt(label, penalties)}%
+                        </div>
+                        <div style={{ color: "#94a3b8" }}>Aportado: {gbp(d.contributed)}</div>
+                        <div style={{ color: EXTRA_COLOR }}>Pagos extra: deuda −{gbp(d.mortgage)} (penalizaciones {gbp(d.mortgagePenalty)})</div>
+                        <div style={{ color: SP_COLOR }}>S&amp;P (cartera {gbp(d.spVal)}): deuda −{gbp(d.sp)}</div>
+                      </div>
+                    );
+                  }}
+                />
+                <Legend wrapperStyle={{ fontSize: 10, color: "#4a6580" }} />
+                {penalties.map((p, i) =>
+                  p > 0 && (i + 1) * 12 < lumpH ? (
+                    <ReferenceLine key={i} x={(i + 1) * 12 + 1} stroke={PES_COLOR} strokeOpacity={0.4} strokeDasharray="2 3" />
+                  ) : null
+                )}
+                <Line type="monotone" dataKey="contributed" name="Total aportado" stroke="#64748b" strokeWidth={1.5} strokeDasharray="4 3" dot={false} />
+                <Line type="monotone" dataKey="mortgage" name="Pagos extra a la hipoteca" stroke={EXTRA_COLOR} strokeWidth={2} dot={false} />
+                <Line type="monotone" dataKey="sp" name="S&P 500 y amortizar" stroke={SP_COLOR} strokeWidth={2} dot={false} />
+              </ComposedChart>
+            </ResponsiveContainer>
+            <div style={{ fontSize: 10, color: "#334155", margin: "6px 0 8px" }}>
+              Ojo: amortizar es un ahorro garantizado al tipo de la hipoteca; el S&amp;P 500 es volátil (puede estar en pérdidas justo en el mes {lumpH}).
+              Usa 0% de impuesto si inviertes dentro de un ISA.
+            </div>
+          </>
+        ) : (
+          <div style={{ fontSize: 11, color: "#4a6580", paddingBottom: 10 }}>Introduce un capital inicial o una aportación mensual para comparar.</div>
+        )}
       </div>
 
       <div style={{ background: "#161b27", border: "1px solid #1e2537", borderRadius: 12, padding: "16px 16px 8px", marginTop: 20, marginBottom: 20 }}>
